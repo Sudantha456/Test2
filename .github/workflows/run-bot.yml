@@ -28,34 +28,33 @@ jobs:
       - name: Install System Dependencies (FFmpeg, Aria2)
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg aria2 curl gpg
+          sudo apt-get install -y ffmpeg aria2 curl gpg dbus-x11
 
-      - name: Install and Start Cloudflare WARP SOCKS5 Proxy
+      - name: Install and Launch Cloudflare WARP SOCKS5 Proxy
         run: |
-          # Add Cloudflare GPG key and repo
+          # 1. Cloudflare GPG key and repo setup
           curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | sudo gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
           echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/cloudflare-warp.list
-
-          # Install WARP
           sudo apt-get update
           sudo apt-get install -y cloudflare-warp
 
-          # Start daemon if not running
-          sudo systemctl start warp-svc.service || true
-          sleep 2
+          # 2. Start warp-svc directly in background without systemd
+          sudo warp-svc &
+          sleep 4
 
-          # Configure WARP in SOCKS5 proxy mode on port 40000
+          # 3. Configure WARP in SOCKS5 proxy mode on port 40000
           warp-cli --accept-tos registration new || warp-cli registration new || true
           warp-cli --accept-tos mode proxy || warp-cli mode proxy || true
           warp-cli --accept-tos proxy port 40000 || warp-cli proxy port 40000 || true
           warp-cli --accept-tos connect || warp-cli connect || true
 
           # Wait for tunnel connection
-          sleep 4
+          sleep 5
 
-          # Verify WARP proxy is working
-          echo "Testing WARP proxy..."
-          curl -fsS --socks5-hostname 127.0.0.1:40000 "https://cloudflare.com/cdn-cgi/trace" || echo "WARN: Direct trace probe failed, continuing..."
+          # 4. Verify WARP proxy is actually active and output status
+          echo "=== VERIFYING WARP CONNECTION ==="
+          curl -fsS --socks5-hostname 127.0.0.1:40000 "https://cloudflare.com/cdn-cgi/trace" || echo "WARN: Direct trace probe failed"
+          echo "=== WARP SETUP COMPLETED ==="
 
       - name: Install Python Dependencies
         run: |
