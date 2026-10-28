@@ -49,7 +49,7 @@ except ImportError:
 HTTP_V1_1 = getattr(CurlHttpVersion, "V1_1", 2) if CurlHttpVersion else 2
 HAS_ARIA2C = bool(shutil.which("aria2c"))
 
-# ==================== CONFIG (1GB RAM / 1 OCPU + TURBO SPEED) ====================
+# ==================== CONFIG ====================
 
 BASE_DIR = Path(__file__).resolve().parent
 ENV_FILE = BASE_DIR / ".env"
@@ -83,8 +83,8 @@ MAX_CONCURRENT = max(1, int(os.getenv("BOT_MAX_CONCURRENT", "2")))
 MAX_QUEUE_PER_USER = max(1, int(os.getenv("BOT_MAX_QUEUE_PER_USER", "10")))
 PROGRESS_INTERVAL = max(1.5, float(os.getenv("PROGRESS_INTERVAL", "2.0")))
 
-# Cloudflare WARP SOCKS5 Proxy (Used ONLY when direct IP is blocked for maximum speed!)
-YTDLP_PROXY = os.getenv("YTDLP_PROXY", "socks5://127.0.0.1:40000").strip()
+# Cloudflare WARP SOCKS5 Proxy (Optional on GitHub Actions, required on blocked VPS)
+YTDLP_PROXY = os.getenv("YTDLP_PROXY", "").strip()
 
 if not API_ID or not API_HASH or not BOT_TOKEN:
     raise SystemExit(f"Missing API_ID, API_HASH or TELEGRAM_BOT_TOKEN in {ENV_FILE}")
@@ -115,7 +115,6 @@ AD_URL_KEYWORDS = (
     "thumb", "sprite", "pixel", "analytics",
 )
 
-# 1GB RAM සඳහා Workers 4 කට optimize කර ඇත
 app = Client(
     "reclip_telegram_bot",
     api_id=API_ID,
@@ -126,16 +125,13 @@ app = Client(
     max_concurrent_transmissions=3,
 )
 
-# Bounded Caches (1GB RAM ආරක්ෂා කිරීම සඳහා)
 MAX_CACHE_ENTRIES = 60
 MAX_LINK_SESSIONS = 80
 
-# Per-link independent sessions: link_id -> {"uid", "url", "info", "qualities", "mode", "ts"}
 link_sessions: dict[str, dict] = {}
 url_info_cache: dict[str, tuple[float, dict]] = {}
 CACHE_TTL_SECONDS = 900
 
-# Smart 10-Item Queue & Job Tracking
 user_queues: dict[int, deque[dict]] = {}
 user_workers: dict[int, asyncio.Task] = {}
 jobs_by_id: dict[str, dict] = {}
@@ -159,7 +155,7 @@ def get_global_sem() -> asyncio.Semaphore:
 
 
 def trim_memory():
-    """Keep memory footprint tiny on 1GB RAM VPS."""
+    """Keep memory footprint tiny."""
     now = time.time()
     expired_urls = [k for k, (ts, _) in url_info_cache.items() if now - ts > CACHE_TTL_SECONDS]
     for k in expired_urls:
@@ -197,10 +193,6 @@ def cleanup_job_files(job_id: str):
 
 
 def _low_priority_preexec():
-    """
-    Set new process group AND lower CPU priority (nice 15) so FFmpeg/curl/aria2c
-    never starves other services running on the 1 OCPU Oracle VM!
-    """
     os.setsid()
     try:
         os.nice(15)
@@ -225,11 +217,6 @@ def force_kill_process_tree(proc: subprocess.Popen | None):
 
 
 def cancel_specific_job(uid: int, job_id: str) -> str:
-    """
-    Cancel a specific job by job_id:
-    - If it's waiting in the queue, remove it immediately.
-    - If it's currently downloading/uploading, force-kill its process tree & move to next item in queue!
-    """
     with active_lock:
         q = user_queues.get(uid)
         if q:
@@ -269,7 +256,6 @@ def cancel_specific_job(uid: int, job_id: str) -> str:
 
 
 def cancel_all_user_jobs(uid: int) -> tuple[bool, int]:
-    """Cancel currently running job AND clear all queued jobs for a user."""
     queued_items = []
     with active_lock:
         q = user_queues.get(uid)
@@ -335,7 +321,7 @@ def run_tracked_subprocess(cmd: list[str], job_id: str, timeout: int = 900):
     return stdout
 
 
-# ==================== FFMPEG VIDEO VERIFICATION (1 OCPU SAFE) ====================
+# ==================== FFMPEG VIDEO VERIFICATION ====================
 
 def probe_video_metadata(video_path: Path) -> dict:
     meta = {
@@ -360,7 +346,7 @@ def probe_video_metadata(video_path: Path) -> dict:
                 str(video_path),
             ],
             stderr=subprocess.DEVNULL,
-            timeout=20,
+            timeout=25,
         )
         data = json.loads(out.decode("utf-8", errors="replace"))
 
@@ -416,7 +402,6 @@ def probe_video_metadata(video_path: Path) -> dict:
         else:
             meta["duration"] = int(round(fmt_dur))
 
-        # Check if MP4 already has 'moov' atom near the start of the file (first 64KB)
         try:
             with open(video_path, "rb") as f:
                 header_bytes = f.read(65536)
@@ -435,21 +420,16 @@ def probe_video_metadata(video_path: Path) -> dict:
 
 def ensure_playable_seekable_mp4(video_path: Path, job_id: str) -> tuple[Path, dict]:
     if not video_path.is_file() or video_path.stat().st_size < 10 * 1024:
-        raise RuntimeError(
-            "Downloaded file is empty or corrupted (only header/moov atom received)."
-        )
+        raise RuntimeError("Downloaded file is empty or corrupted.")
 
     initial_meta = probe_video_metadata(video_path)
     if not initial_meta["has_video"] or initial_meta["width"] == 0:
-        raise RuntimeError(
-            "Downloaded file has no playable video stream."
-        )
+        raise RuntimeError("Downloaded file has no playable video stream.")
 
     vcodec = initial_meta["vcodec"]
     acodec = initial_meta["acodec"]
     can_stream_copy = vcodec in ("h264", "avc1", "hevc", "h265") and acodec in ("aac", "mp3", "")
 
-    # Fast-path: If yt-dlp/ffmpeg already wrote moov atom at front and codecs are valid, skip extra remux!
     if can_stream_copy and initial_meta["faststart_ready"] and initial_meta["duration"] > 0:
         return video_path, initial_meta
 
@@ -479,10 +459,9 @@ def ensure_playable_seekable_mp4(video_path: Path, job_id: str) -> tuple[Path, d
         except JobCancelledError:
             raise
         except Exception as exc:
-            log.warning("Stream copy remux failed (%s), falling back to 1-thread H.264 encode", exc)
+            log.warning("Stream copy remux failed (%s), falling back to H.264 encode", exc)
             fixed_path.unlink(missing_ok=True)
 
-    # 1-Thread ultrafast re-encode so 1 OCPU VM stays responsive
     encode_cmd = [
         "ffmpeg", "-y",
         "-threads", "1",
@@ -547,13 +526,17 @@ def generate_video_thumbnail(
 
 # ==================== URL HELPERS ====================
 
+def is_youtube_url(url: str) -> bool:
+    host = (urlparse(url).hostname or "").lower()
+    return host in {"youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be", "music.youtube.com"}
+
+
 def is_tiktok_url(url: str) -> bool:
     host = (urlparse(url).hostname or "").lower()
     return host == "tiktok.com" or host.endswith(".tiktok.com")
 
 
 def is_known_ytdlp_site(url: str) -> bool:
-    """Identify sites with fast native yt-dlp extractors vs generic KVS/HTML sites."""
     host = (urlparse(url).hostname or "").lower()
     known = (
         "youtube.com", "youtu.be", "facebook.com", "fb.watch", "instagram.com",
@@ -574,7 +557,6 @@ def is_ad_or_junk_url(url: str) -> bool:
 
 def normalize_url(url: str) -> str:
     url = url.strip()
-
     try:
         parsed = urlparse(url)
         host = (parsed.hostname or "").lower()
@@ -583,19 +565,11 @@ def normalize_url(url: str) -> str:
         if host == "youtu.be":
             video_id = parsed.path.strip("/").split("/")[0]
 
-        elif host in {
-            "youtube.com",
-            "www.youtube.com",
-            "m.youtube.com",
-            "music.youtube.com",
-        }:
+        elif host in {"youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com"}:
             if parsed.path == "/watch":
                 video_id = parse_qs(parsed.query).get("v", [None])[0]
             else:
-                match = re.match(
-                    r"^/(?:shorts|embed|live)/([A-Za-z0-9_-]{11})",
-                    parsed.path,
-                )
+                match = re.match(r"^/(?:shorts|embed|live)/([A-Za-z0-9_-]{11})", parsed.path)
                 if match:
                     video_id = match.group(1)
 
@@ -648,22 +622,18 @@ def strip_ansi(text: str) -> str:
 def cookie_profile_dir(uid: int) -> Path:
     folder = COOKIE_ROOT / str(uid)
     folder.mkdir(parents=True, exist_ok=True)
-
     try:
         folder.chmod(0o700)
     except OSError:
         pass
-
     return folder
 
 
 def parse_cookie_file(path: Path) -> list[dict]:
     records = []
-
     with open(path, "r", encoding="utf-8", errors="replace") as stream:
         for raw in stream:
             line = raw.rstrip("\r\n")
-
             if not line:
                 continue
 
@@ -673,15 +643,10 @@ def parse_cookie_file(path: Path) -> list[dict]:
                 continue
 
             fields = line.split("\t")
-
             if len(fields) != 7:
-                raise ValueError(
-                    "Invalid Netscape cookies.txt format: "
-                    "expected 7 tab-separated fields per cookie."
-                )
+                raise ValueError("Invalid Netscape cookies.txt format.")
 
             domain, subdomains, cookie_path, secure, expiry, name, value = fields
-
             if not domain or not name:
                 continue
 
@@ -692,9 +657,7 @@ def parse_cookie_file(path: Path) -> list[dict]:
 
             records.append({
                 "domain": domain.lstrip(".").lower(),
-                "include_subdomains": (
-                    subdomains.upper() == "TRUE" or domain.startswith(".")
-                ),
+                "include_subdomains": (subdomains.upper() == "TRUE" or domain.startswith(".")),
                 "path": cookie_path or "/",
                 "secure": secure.upper() == "TRUE",
                 "expiry": expires,
@@ -710,34 +673,25 @@ def parse_cookie_file(path: Path) -> list[dict]:
 def cookie_domain_matches(cookie_domain, include_subdomains, host):
     cookie_domain = cookie_domain.lstrip(".").lower()
     host = (host or "").strip(".").lower()
-
     if host == cookie_domain or (include_subdomains and host.endswith("." + cookie_domain)):
         return True
-
     if host.endswith("." + cookie_domain):
         return True
-
     return False
 
 
 def cookie_profiles(uid: int) -> list[dict]:
     result = []
-
     for path in sorted(cookie_profile_dir(uid).glob("*.txt")):
         try:
             records = parse_cookie_file(path)
             now = int(time.time())
-
             result.append({
                 "domain": path.stem,
                 "path": path,
                 "count": len(records),
-                "expired": sum(
-                    1 for r in records
-                    if r["expiry"] and r["expiry"] <= now
-                ),
+                "expired": sum(1 for r in records if r["expiry"] and r["expiry"] <= now),
             })
-
         except (ValueError, OSError):
             result.append({
                 "domain": path.stem,
@@ -746,14 +700,12 @@ def cookie_profiles(uid: int) -> list[dict]:
                 "expired": 0,
                 "invalid": True,
             })
-
     return result
 
 
 def cookie_file_for_url(uid: int, url: str):
     url = normalize_url(url)
     host = (urlparse(url).hostname or "").lower()
-
     if not host:
         return None
 
@@ -771,50 +723,32 @@ def cookie_file_for_url(uid: int, url: str):
 
         matching = [
             r for r in records
-            if cookie_domain_matches(
-                r["domain"],
-                r["include_subdomains"],
-                host,
-            )
+            if cookie_domain_matches(r["domain"], r["include_subdomains"], host)
             and not (r["expiry"] and r["expiry"] <= now)
         ]
 
         if matching:
-            candidates.append((
-                len(profile["domain"]),
-                len(matching),
-                profile["path"],
-            ))
+            candidates.append((len(profile["domain"]), len(matching), profile["path"]))
 
-    selected = max(
-        candidates,
-        default=(0, 0, None),
-        key=lambda item: (item[0], item[1]),
-    )[2]
-
+    selected = max(candidates, default=(0, 0, None), key=lambda item: (item[0], item[1]))[2]
     if selected:
-        log.info(
-            "Cookie profile selected: %s for host %s",
-            selected.name,
-            host,
-        )
+        log.info("Cookie profile selected: %s for host %s", selected.name, host)
     return selected
 
 
 def cookie_options_for_url(uid: int, url: str) -> dict:
     path = cookie_file_for_url(uid, url)
-
     if path and path.is_file():
         return {"cookiefile": str(path)}
-
     return {}
 
 
-# ==================== YT-DLP OPTIONS (TURBO SPEED BOOSTED) ====================
+# ==================== YT-DLP OPTIONS (DATACENTER & BOT-BYPASS FIX) ====================
 
 def make_ytdlp_options(uid, url, extra=None, fast_fetch=False, use_proxy=False):
     parsed = urlparse(url)
     origin = f"{parsed.scheme}://{parsed.netloc}" if parsed.scheme and parsed.netloc else url
+    is_yt = is_youtube_url(url)
 
     options = {
         "quiet": True,
@@ -823,30 +757,32 @@ def make_ytdlp_options(uid, url, extra=None, fast_fetch=False, use_proxy=False):
         "noplaylist": True,
         "geo_bypass": True,
         "source_address": "0.0.0.0",
-        "socket_timeout": 6 if fast_fetch else 20,
+        "socket_timeout": 12 if fast_fetch else 25,
         "retries": 1 if fast_fetch else 3,
-        "extractor_retries": 1 if fast_fetch else 2,
+        "extractor_retries": 2 if fast_fetch else 3,
         "fragment_retries": 4,
-        # TURBO SPEED FIX:
-        # 1) 10MB HTTP Chunk Size bypasses per-connection bandwidth throttling (120 KB/s -> 20+ MB/s!)
         "http_chunk_size": 10485760,
-        # 2) 6 Concurrent fragments for HLS/DASH streams (light on RAM, huge speed boost)
         "concurrent_fragment_downloads": 6,
         "buffersize": 1024 * 64,
-        "format_sort": ["vcodec:h264", "acodec:aac", "ext:mp4:m4a"],
+        "format_sort": ["res", "vcodec:h264", "acodec:aac", "ext:mp4:m4a"],
         "http_headers": {
             "User-Agent": DEFAULT_UA,
             "Referer": url,
             "Origin": origin,
-        },
-        "extractor_args": {
-            "youtube": {
-                "player_client": ["default", "web_embedded"],
-            },
+            "Accept-Language": "en-US,en;q=0.9",
         },
     }
 
-    # If aria2c is installed on the VPS, use it for multi-connection progressive HTTP downloads
+    # CRITICAL YOUTUBE FIX: Datacenter & GitHub Actions IP Bypass
+    if is_yt:
+        options["extractor_args"] = {
+            "youtube": {
+                # Fallback across android and ios clients so YouTube never returns empty formats on cloud IPs
+                "player_client": ["android", "ios", "mweb", "web"],
+                "player_skip": ["webpage", "configs"],
+            },
+        }
+
     if HAS_ARIA2C and not fast_fetch:
         options["external_downloader"] = {"default": "aria2c"}
         options["external_downloader_args"] = {
@@ -954,7 +890,7 @@ def quality_options(info: dict) -> list[tuple[str, str]]:
             continue
 
         fmt_id = str(fmt.get("format_id") or "")
-        if not fmt_id or len(fmt_id) > 35:
+        if not fmt_id or len(fmt_id) > 40:
             continue
 
         is_h264 = 1 if ("avc" in vcodec or "h264" in vcodec) else 0
@@ -985,8 +921,9 @@ def build_video_format_selector(info: dict, selection: str) -> str:
     if selection == "best" or not selection:
         return (
             "bestvideo[vcodec^=avc1]+bestaudio[acodec^=mp4a]/"
-            "bestvideo[vcodec^=h264]+bestaudio/"
-            "bestvideo+bestaudio/best"
+            "bestvideo[vcodec^=avc1]+bestaudio/"
+            "bestvideo+bestaudio/"
+            "best"
         )
 
     if "|" in selection:
@@ -1024,16 +961,11 @@ def build_video_format_selector(info: dict, selection: str) -> str:
         parts.append(f"best[height={height}]")
         parts.append(f"bestvideo[height<={height}]+bestaudio/best[height<={height}]")
 
+    parts.append("bestvideo+bestaudio/best")
     return "/".join(parts)
 
 
 def can_direct_fast_download(info: dict, mode: str, selection: str) -> bool:
-    """
-    INSTANT START OPTIMIZATION:
-    If the already-extracted info dict contains a direct single-file URL (with audio+video)
-    for the user's selected quality, we can start downloading IMMEDIATELY in 0.05s
-    without waiting 4-8 seconds for yt-dlp to re-extract the webpage!
-    """
     if info.get("_tiktok_fallback"):
         return True
     if mode == "audio":
@@ -1058,7 +990,6 @@ def can_direct_fast_download(info: dict, mode: str, selection: str) -> bool:
             if str(fmt.get("format_id") or "") != fmt_id and (not target_h or infer_format_height(fmt) != target_h):
                 continue
         else:
-            # For 'best', only use direct fast-path if the highest format is a combined stream
             best_f = max(formats, key=lambda x: infer_format_height(x))
             if fmt is not best_f:
                 continue
@@ -1081,7 +1012,7 @@ def can_direct_fast_download(info: dict, mode: str, selection: str) -> bool:
     return False
 
 
-# ==================== ULTRA-FAST PARALLEL RACING FETCHER & TURBO DOWNLOADER ====================
+# ==================== KVS & GENERIC EXTRACTOR ====================
 
 def decrypt_kvs_url(real_url: str, license_code: str) -> str:
     real_url = real_url.strip()
@@ -1176,11 +1107,6 @@ def _is_valid_unblocked_html(text: str) -> bool:
 
 
 def fetch_html_parallel_race(url: str, uid: int) -> tuple[str, dict[str, str], str | None]:
-    """
-    Race multiple lightweight HTTP pathways concurrently.
-    Returns (html_text, cookies_dict, winning_proxy).
-    Prioritizes Direct connection when unblocked so downloads run at full gigabit VPS speed!
-    """
     saved_cookie_path = cookie_file_for_url(uid, url)
     saved_cookies_dict: dict[str, str] = {}
     if saved_cookie_path and saved_cookie_path.is_file():
@@ -1212,7 +1138,7 @@ def fetch_html_parallel_race(url: str, uid: int) -> tuple[str, dict[str, str], s
             cookies=saved_cookies_dict or None,
             http_version=HTTP_V1_1,
             proxy=proxy_val,
-            timeout=6,
+            timeout=7,
             allow_redirects=True,
         )
         if resp.status_code == 200 and _is_valid_unblocked_html(resp.text):
@@ -1234,7 +1160,7 @@ def fetch_html_parallel_race(url: str, uid: int) -> tuple[str, dict[str, str], s
             headers=headers,
             cookies=saved_cookies_dict or None,
             proxies=proxies,
-            timeout=6,
+            timeout=7,
         )
         if resp.status_code == 200 and _is_valid_unblocked_html(resp.text):
             cookies = dict(saved_cookies_dict)
@@ -1252,7 +1178,7 @@ def fetch_html_parallel_race(url: str, uid: int) -> tuple[str, dict[str, str], s
         if saved_cookies_dict:
             req_headers["Cookie"] = "; ".join(f"{k}={v}" for k, v in saved_cookies_dict.items())
         req = urllib.request.Request(url, headers=req_headers)
-        with opener.open(req, timeout=5) as resp:
+        with opener.open(req, timeout=6) as resp:
             page_html = resp.read().decode("utf-8", errors="replace")
             if _is_valid_unblocked_html(page_html):
                 cookies = dict(saved_cookies_dict)
@@ -1262,16 +1188,12 @@ def fetch_html_parallel_race(url: str, uid: int) -> tuple[str, dict[str, str], s
         raise RuntimeError("urllib blocked")
 
     tasks = []
-    # Put Direct connections first so if the site isn't blocking our IP, we get unthrottled direct speed!
     if HAS_CURL_CFFI:
         tasks.append(lambda: _try_cffi(None, "chrome110"))
         if YTDLP_PROXY:
             tasks.append(lambda: _try_cffi(YTDLP_PROXY, "chrome110"))
-            tasks.append(lambda: _try_cffi(YTDLP_PROXY, "safari15_5"))
     if HAS_CLOUDSCRAPER:
         tasks.append(lambda: _try_cloudscraper(None))
-        if YTDLP_PROXY:
-            tasks.append(lambda: _try_cloudscraper(YTDLP_PROXY))
     tasks.append(_try_urllib)
 
     last_err = None
@@ -1285,7 +1207,7 @@ def fetch_html_parallel_race(url: str, uid: int) -> tuple[str, dict[str, str], s
             except Exception as exc:
                 last_err = exc
 
-    raise last_err or RuntimeError("Cloudflare blocked all fast pathways. Upload cookies via /cookies domain.com")
+    raise last_err or RuntimeError("Cloudflare challenge blocked connection.")
 
 
 def expand_hls_master_playlist(m3u8_url: str, referer: str, cookies: dict[str, str], uid: int) -> list[dict]:
@@ -1361,7 +1283,6 @@ def generic_cffi_extract(url: str, uid: int = 0) -> dict:
     formats = []
     urls_map = {}
 
-    # 1. KVS Player flashvars decryptor
     kvs_streams = extract_kvs_flashvars(page_html, url)
     for fid, height, stream_url in kvs_streams:
         formats.append({
@@ -1374,7 +1295,6 @@ def generic_cffi_extract(url: str, uid: int = 0) -> dict:
         })
         urls_map[fid] = stream_url
 
-    # 2. Scan for <source src="..." label="720p"> tags
     if not formats:
         for src_m in re.finditer(r"<source\b([^>]+)>", page_html, re.IGNORECASE):
             attrs = src_m.group(1)
@@ -1400,7 +1320,6 @@ def generic_cffi_extract(url: str, uid: int = 0) -> dict:
             })
             urls_map[fid] = raw_u
 
-    # 3. Scan for raw .m3u8 / .mp4 / get_file URLs
     if not formats:
         raw_urls = re.findall(
             r'(?:https?:)?//[^\s"\'<>\\]+(?:\.(?:mp4|m3u8)|get_file/[^\s"\'<>\\]+)(?:\?[^\s"\'<>\\]*)?',
@@ -1440,10 +1359,7 @@ def generic_cffi_extract(url: str, uid: int = 0) -> dict:
             urls_map[fid] = media_url
 
     if not formats:
-        raise RuntimeError(
-            "Cloudflare anti-bot blocked this page or no video streams were found. "
-            "Upload fresh cookies with /cookies domain.com"
-        )
+        raise RuntimeError("No downloadable video streams found on this page.")
 
     best_fmt = max(formats, key=lambda f: f.get("height") or 0)
     urls_map["best"] = best_fmt["url"]
@@ -1465,7 +1381,6 @@ def generic_cffi_extract(url: str, uid: int = 0) -> dict:
 
 def tiktok_fallback_extract(url: str) -> dict:
     if HAS_CURL_CFFI:
-        # Try direct first for speed, fallback to WARP proxy
         payload = None
         for prx in ([None, YTDLP_PROXY] if YTDLP_PROXY else [None]):
             try:
@@ -1603,11 +1518,6 @@ def _multi_connection_range_download(
     download_hook,
     num_connections: int = 6,
 ) -> bool:
-    """
-    TURBO PARALLEL RANGE DOWNLOADER:
-    Splits a single throttled MP4 file into 6 parallel byte-range streams.
-    Turns a 120 KB/s throttled CDN stream into a fast multi-megabit download while using <4MB RAM!
-    """
     with open(dest_path, "wb") as f:
         f.truncate(total_size)
 
@@ -1641,7 +1551,6 @@ def _multi_connection_range_download(
         try:
             if resp.status_code not in (200, 206):
                 raise RuntimeError(f"Segment HTTP {resp.status_code}")
-            # If server ignored Range header and sent 200 full file on non-zero offset, abort parallel mode
             if s_byte > 0 and resp.status_code == 200:
                 raise RuntimeError("Server does not support byte ranges")
 
@@ -1755,19 +1664,13 @@ def direct_cffi_download(
         )
     else:
         downloaded_ok = False
-        # SPEED FIX: Try Direct (None) BEFORE WARP proxy unless page required proxy!
-        # Many CDNs allow direct video stream downloads even when the HTML webpage is behind Cloudflare.
-        if info.get("_use_proxy") and YTDLP_PROXY:
-            proxy_candidates = [None, YTDLP_PROXY]
-        else:
-            proxy_candidates = [None, YTDLP_PROXY] if YTDLP_PROXY else [None]
+        proxy_candidates = [None, YTDLP_PROXY] if YTDLP_PROXY else [None]
 
         if HAS_CURL_CFFI:
             for prx in proxy_candidates:
                 if downloaded_ok:
                     break
                 try:
-                    # Probe stream with Range: bytes=0-0 to discover final redirect URL, size & Range support
                     probe_headers = dict(headers)
                     probe_headers["Range"] = "bytes=0-0"
                     probe_resp = cffi_requests.get(
@@ -1804,7 +1707,6 @@ def direct_cffi_download(
                     elif status_code == 200 and content_len > 0:
                         total_size = content_len
 
-                    # If server supports HTTP 206 Byte Ranges and file > 1.5 MB, use 6-Connection Turbo Downloader!
                     if status_code == 206 and total_size > 1536 * 1024:
                         try:
                             downloaded_ok = _multi_connection_range_download(
@@ -1825,7 +1727,6 @@ def direct_cffi_download(
                         except Exception as rng_exc:
                             log.debug("Multi-connection range download fallback: %s", rng_exc)
 
-                    # Single-stream high-buffer fallback (256KB chunks)
                     resp = cffi_requests.get(
                         final_url,
                         impersonate="chrome110",
@@ -1917,17 +1818,15 @@ def direct_cffi_download(
     return raw_video_path
 
 
-# ==================== SMART ZERO-DELAY EXTRACTOR ROUTING ====================
+# ==================== EXTRACTION ROUTING (YOUTUBE DATA-CENTER SAFE) ====================
 
 def extract_info(url: str, uid: int) -> dict:
     url = normalize_url(url)
 
-    # 1. Check Instant RAM Cache (0.01s response if fetched recently)
     cached = url_info_cache.get(url)
     if cached and (time.time() - cached[0] < CACHE_TTL_SECONDS):
         return dict(cached[1])
 
-    # 2. TikTok Fast-Path: Go straight to TikWM API (< 1 second, no yt-dlp overhead)
     if is_tiktok_url(url):
         try:
             info = tiktok_fallback_extract(url)
@@ -1936,54 +1835,63 @@ def extract_info(url: str, uid: int) -> dict:
         except Exception as tk_exc:
             log.debug("TikWM fast-path failed (%s), falling back to yt-dlp", tk_exc)
 
-    # 3. Unknown/Generic KVS Sites: Go straight to Parallel HTTP/1.1 Racing Extractor first
-    if not is_known_ytdlp_site(url):
-        try:
-            info = generic_cffi_extract(url, uid)
-            if info and info.get("formats"):
-                url_info_cache[url] = (time.time(), info)
-                return info
-        except Exception as gen_exc:
-            log.debug("Fast parallel generic extractor skipped (%s), trying yt-dlp", gen_exc)
+    is_yt = is_youtube_url(url)
 
-    # 4. Known Sites (YouTube, FB, IG, X, Pornhub, etc.): Try Direct IPv4 first for maximum download speed!
-    for use_prx in ([False, True] if YTDLP_PROXY else [False]):
-        fast_options = make_ytdlp_options(
-            uid,
-            url,
-            {"skip_download": True, "ignore_no_formats_error": True},
-            fast_fetch=True,
-            use_proxy=use_prx,
-        )
-        try:
-            with yt_dlp.YoutubeDL(fast_options) as ydl:
-                raw_info = ydl.extract_info(url, download=False)
-                info = unwrap_main_entry(raw_info)
-                if info and (info.get("formats") or info.get("url")):
-                    info["_use_proxy"] = use_prx
-                    quals = quality_options(info)
-                    if len(quals) <= 1 and info.get("url") and ".m3u8" in str(info.get("url")).lower():
-                        variants = expand_hls_master_playlist(info["url"], url, {}, uid)
-                        if len(variants) > 1:
-                            info["formats"] = variants
-                    url_info_cache[url] = (time.time(), info)
-                    return info
-        except Exception as exc:
-            err_text = str(exc)
-            log.info("yt-dlp extract (proxy=%s) failed: %s", use_prx, err_text[:120])
-            if "flashvars" in err_text.lower() or "403" in err_text or "[generic]" in err_text.lower():
-                break
+    # YouTube is ALWAYS extracted via yt-dlp (never passed to Cloudflare generic extractors)
+    if is_yt or is_known_ytdlp_site(url):
+        last_yt_err = None
+        for use_prx in ([False, True] if YTDLP_PROXY else [False]):
+            fast_options = make_ytdlp_options(
+                uid,
+                url,
+                {"skip_download": True, "ignore_no_formats_error": False},
+                fast_fetch=True,
+                use_proxy=use_prx,
+            )
+            try:
+                with yt_dlp.YoutubeDL(fast_options) as ydl:
+                    raw_info = ydl.extract_info(url, download=False)
+                    info = unwrap_main_entry(raw_info)
+                    if info and (info.get("formats") or info.get("url")):
+                        info["_use_proxy"] = use_prx
+                        url_info_cache[url] = (time.time(), info)
+                        return info
+            except Exception as exc:
+                last_yt_err = exc
+                log.info("Native extract (proxy=%s) failed: %s", use_prx, str(exc)[:120])
 
-    # 5. Final fallback to Parallel Racing Extractor
+        if is_yt:
+            raise last_yt_err or RuntimeError("YouTube rejected extraction. Try updating cookies via /cookies youtube.com")
+
+    # Generic & KVS Sites
+    try:
+        info = generic_cffi_extract(url, uid)
+        if info and info.get("formats"):
+            url_info_cache[url] = (time.time(), info)
+            return info
+    except Exception as gen_exc:
+        log.debug("Fast generic extractor skipped (%s), trying yt-dlp", gen_exc)
+
+    fast_options = make_ytdlp_options(
+        uid,
+        url,
+        {"skip_download": True, "ignore_no_formats_error": True},
+        fast_fetch=True,
+        use_proxy=bool(YTDLP_PROXY),
+    )
+    with yt_dlp.YoutubeDL(fast_options) as ydl:
+        raw_info = ydl.extract_info(url, download=False)
+        info = unwrap_main_entry(raw_info)
+        if info and (info.get("formats") or info.get("url")):
+            url_info_cache[url] = (time.time(), info)
+            return info
+
     info = generic_cffi_extract(url, uid)
     url_info_cache[url] = (time.time(), info)
     return info
 
 
 def run_ytdlp_fast(options: dict, url: str):
-    """
-    Run yt-dlp download directly.
-    """
     try:
         with yt_dlp.YoutubeDL(options) as ydl:
             ydl.download([url])
@@ -2056,7 +1964,7 @@ async def edit_progress(message, text, force=False, reply_markup=None):
             log.debug("Progress edit failed: %s", exc)
 
 
-# ==================== KEYBOARDS (PER-LINK & PER-JOB) ====================
+# ==================== KEYBOARDS ====================
 
 def cancel_keyboard(uid: int, job_id: str, is_queued: bool = False) -> InlineKeyboardMarkup:
     btn_text = "🗑 Remove from Queue" if is_queued else "⛔ Cancel Download (Next in Queue)"
@@ -2110,15 +2018,11 @@ async def cookies_command(client, message):
 
     if len(args) == 2:
         domain = normalize_domain(args[1])
-
         if not domain:
-            await message.reply_text(
-                "Send a valid domain, e.g. /cookies youtube.com"
-            )
+            await message.reply_text("Send a valid domain, e.g. /cookies youtube.com")
             return
 
         cookie_upload_targets[uid] = domain
-
         await message.reply_text(
             f"🍪 Upload target: <code>{html.escape(domain)}</code>\n"
             "Now upload your Netscape-format cookies.txt as a document."
@@ -2126,7 +2030,6 @@ async def cookies_command(client, message):
         return
 
     profiles = cookie_profiles(uid)
-
     if not profiles:
         await message.reply_text(
             "🍪 No cookie profiles saved.\n"
@@ -2135,16 +2038,13 @@ async def cookies_command(client, message):
         return
 
     lines = ["🍪 <b>Your cookie profiles</b>"]
-
     for profile in profiles:
         status = (
             "invalid format"
             if profile.get("invalid")
             else f"{profile['count']} cookies · {profile['expired']} expired"
         )
-        lines.append(
-            f"• <code>{html.escape(profile['domain'])}</code> — {status}"
-        )
+        lines.append(f"• <code>{html.escape(profile['domain'])}</code> — {status}")
 
     lines.append("\nUse /cookieinfo, /checkcookies URL, or /deletecookies domain.")
     await message.reply_text("\n".join(lines))
@@ -2153,16 +2053,13 @@ async def cookies_command(client, message):
 @app.on_message(filters.private & filters.command("cookieinfo"))
 async def cookieinfo_command(client, message):
     profiles = cookie_profiles(message.from_user.id)
-
     if not profiles:
         await message.reply_text("No cookie profiles saved.")
         return
 
     lines = ["🍪 <b>Cookie profile details</b>"]
-
     for profile in profiles:
         lines.append(f"\n<b>{html.escape(profile['domain'])}</b>")
-
         if profile.get("invalid"):
             lines.append("Invalid cookie format")
             continue
@@ -2185,11 +2082,8 @@ async def cookieinfo_command(client, message):
 @app.on_message(filters.private & filters.command("checkcookies"))
 async def checkcookies_command(client, message):
     args = message.text.split(maxsplit=1)
-
     if len(args) != 2 or not valid_url(args[1]):
-        await message.reply_text(
-            "Usage: /checkcookies https://www.youtube.com/watch?v=VIDEO_ID"
-        )
+        await message.reply_text("Usage: /checkcookies https://www.youtube.com/watch?v=VIDEO_ID")
         return
 
     uid = message.from_user.id
@@ -2197,13 +2091,10 @@ async def checkcookies_command(client, message):
     path = cookie_file_for_url(uid, url)
 
     if not path:
-        await message.reply_text(
-            "❌ No unexpired cookie records match this URL."
-        )
+        await message.reply_text("❌ No unexpired cookie records match this URL.")
         return
 
     status = await message.reply_text("⚡ Testing URL with saved cookies…")
-
     try:
         url_info_cache.pop(url, None)
         info = await asyncio.to_thread(extract_info, url, uid)
@@ -2212,13 +2103,11 @@ async def checkcookies_command(client, message):
         await status.edit_text(
             "✅ <b>Extraction succeeded</b>\n"
             f"Title: {html.escape(str(info.get('title') or 'Unknown')[:180])}\n"
-            f"Qualities: <code>{', '.join(lbl for _, lbl in quals) or 'None'}</code>\n"
+            f"Qualities: <code>{', '.join(lbl for _, lbl in quals) or 'Best available'}</code>\n"
             f"Cookie profile: <code>{html.escape(path.name)}</code>"
         )
-
     except Exception as exc:
         log.warning("Cookie extraction test failed: %s", exc)
-
         await status.edit_text(
             "⚠️ <b>Extraction failed</b>\n"
             + html.escape(strip_ansi(str(exc))[:700])
@@ -2229,29 +2118,23 @@ async def checkcookies_command(client, message):
 @app.on_message(filters.private & filters.command("deletecookies"))
 async def deletecookies_command(client, message):
     args = message.text.split(maxsplit=1)
-
     if len(args) != 2:
         await message.reply_text("Usage: /deletecookies youtube.com")
         return
 
     domain = normalize_domain(args[1])
-
     if not domain:
         await message.reply_text("Invalid domain.")
         return
 
     path = cookie_profile_dir(message.from_user.id) / f"{domain}.txt"
-
     if not path.exists():
         await message.reply_text("No exact cookie profile found.")
         return
 
     path.unlink()
     cookie_upload_targets.pop(message.from_user.id, None)
-
-    await message.reply_text(
-        f"🗑 Deleted <code>{html.escape(domain)}</code> cookie profile."
-    )
+    await message.reply_text(f"🗑 Deleted <code>{html.escape(domain)}</code> cookie profile.")
 
 
 @app.on_message(filters.private & filters.document)
@@ -2262,9 +2145,7 @@ async def cookie_upload_handler(client, message):
     filename = (document.file_name or "").lower()
 
     if not target:
-        await message.reply_text(
-            "First send /cookies youtube.com, then upload cookies.txt."
-        )
+        await message.reply_text("First send /cookies youtube.com, then upload cookies.txt.")
         return
 
     if not filename.endswith((".txt", ".cookies")):
@@ -2280,18 +2161,13 @@ async def cookie_upload_handler(client, message):
 
     try:
         await message.reply_text("🔎 Validating cookie file…")
-
-        downloaded = await client.download_media(
-            message,
-            file_name=str(temp),
-        )
+        downloaded = await client.download_media(message, file_name=str(temp))
 
         if not downloaded or not temp.exists():
             raise ValueError("Uploaded file was not saved.")
 
         records = parse_cookie_file(temp)
         profile_path = folder / f"{target}.txt"
-
         os.replace(temp, profile_path)
 
         try:
@@ -2299,15 +2175,7 @@ async def cookie_upload_handler(client, message):
         except OSError:
             pass
 
-        matched = sum(
-            1 for r in records
-            if cookie_domain_matches(
-                r["domain"],
-                r["include_subdomains"],
-                target,
-            )
-        )
-
+        matched = sum(1 for r in records if cookie_domain_matches(r["domain"], r["include_subdomains"], target))
         cookie_upload_targets.pop(uid, None)
 
         await message.reply_text(
@@ -2317,10 +2185,8 @@ async def cookie_upload_handler(client, message):
             f"Matching domain records: {matched}\n"
             "Now use /checkcookies URL to test it."
         )
-
     except Exception as exc:
         temp.unlink(missing_ok=True)
-
         await message.reply_text(
             "❌ Could not save cookies: "
             + html.escape(str(exc)[:500])
@@ -2333,9 +2199,9 @@ async def cookie_upload_handler(client, message):
 @app.on_message(filters.private & filters.command(["start", "help"]))
 async def start_handler(client, message):
     await message.reply_text(
-        "👋 <b>Welcome to ReClip (Turbo Queue Edition)</b>\n\n"
-        "Send multiple media URLs back-to-back! You can choose a different quality for each video and queue up to <b>10 downloads</b> at once.\n\n"
-        "• 🚀 <b>6x Multi-Connection Turbo Speed Boost</b>\n"
+        "👋 <b>Welcome to ReClip (Turbo Edition)</b>\n\n"
+        "Send multiple media URLs! You can choose separate qualities and queue up to <b>10 downloads</b> at once.\n\n"
+        "• 🚀 <b>Multi-Connection Turbo Speed</b>\n"
         "• 📋 <b>10-Item Smart Queue</b> (/queue to view)\n"
         "• ⚡ <b>Zero-Delay Instant Start</b>\n"
         "• 🎬 <b>Independent Per-Video Quality Selection</b>\n"
@@ -2379,8 +2245,7 @@ async def cancel_handler(client, message):
 
     if was_running or cleared_count > 0:
         await message.reply_text(
-            f"🛑 <b>Force-killed active download & cleared {cleared_count} queued item(s)!</b>\n"
-            "VPS storage cleaned."
+            f"🛑 <b>Cancelled active download & cleared {cleared_count} queued item(s)!</b>"
         )
     else:
         await message.reply_text("🧹 No active or queued downloads found.")
@@ -2424,20 +2289,19 @@ async def link_handler(client, message):
         }
 
         title = html.escape(str(info.get("title") or "Untitled")[:180])
-        uploader = html.escape(
-            str(info.get("uploader") or info.get("channel") or "Unknown")[:100]
-        )
+        uploader = html.escape(str(info.get("uploader") or info.get("channel") or "Unknown")[:100])
+        qual_count = len(qualities)
+        qual_badge = f"{qual_count} video qualities found" if qual_count > 0 else "Best available stream ready"
 
         text = (
             f"🎞 <b>{title}</b>\n"
             f"👤 {uploader}\n"
             f"⏱ {duration_text(info.get('duration'))} · ⚡ {elapsed:.1f}s\n"
-            f"🎚 {len(qualities)} video qualities found\n\n"
+            f"🎚 {qual_badge}\n\n"
             "Choose output format:"
         )
 
         thumbnail = info.get("thumbnail")
-
         if thumbnail and thumbnail.startswith(("https://", "http://")):
             try:
                 await client.send_photo(
@@ -2468,7 +2332,6 @@ async def link_handler(client, message):
 # ==================== SMART QUEUE WORKER & FAST EXECUTION ====================
 
 async def refresh_user_queue_positions(uid: int):
-    """Update waiting messages in Telegram when queue advances."""
     with active_lock:
         queued_list = list(user_queues.get(uid, []))
 
@@ -2490,7 +2353,6 @@ async def refresh_user_queue_positions(uid: int):
 
 
 async def process_user_queue(client, uid: int):
-    """Background worker that processes a user's queued downloads one by one."""
     sem = get_global_sem()
     try:
         while True:
@@ -2546,7 +2408,6 @@ async def execute_single_job(client, job: dict):
             raise JobCancelledError("Cancelled by user.")
 
         state = data.get("status")
-
         if state == "finished":
             asyncio.run_coroutine_threadsafe(
                 edit_progress(
@@ -2577,15 +2438,8 @@ async def execute_single_job(client, job: dict):
             )
         ):
             last_hook[:] = [now, percent]
-
-            speed = (
-                f"{human_size(data.get('speed'))}/s"
-                if data.get("speed") else "boosting…"
-            )
-            eta = (
-                duration_text(data.get("eta"))
-                if data.get("eta") is not None else "—"
-            )
+            speed = f"{human_size(data.get('speed'))}/s" if data.get("speed") else "boosting…"
+            eta = duration_text(data.get("eta")) if data.get("eta") is not None else "—"
 
             text = (
                 f"⬇️ <b>Downloading ({html.escape(quality_label)})</b>\n"
@@ -2635,18 +2489,14 @@ async def execute_single_job(client, job: dict):
     thumb_path: Path | None = None
 
     try:
-        # Instant start feedback (<0.05s)
         await edit_progress(
             status_message,
-            f"🚀 <b>Starting turbo download ({html.escape(quality_label)})…</b>\n"
+            f"🚀 <b>Starting download ({html.escape(quality_label)})…</b>\n"
             f"🎞 {html.escape(title[:100])}",
             True,
             reply_markup=cancel_markup,
         )
 
-        # ZERO-DELAY FAST PATH:
-        # If we already have a direct progressive MP4 stream URL from the link fetch,
-        # start downloading immediately with 6x multi-connection range boost instead of re-running yt-dlp extractor!
         if can_direct_fast_download(info, mode, selection):
             try:
                 await asyncio.to_thread(
@@ -2663,7 +2513,7 @@ async def execute_single_job(client, job: dict):
             except Exception as direct_err:
                 if info.get("_tiktok_fallback"):
                     raise
-                log.info("Instant direct fast-path skipped (%s), using yt-dlp", direct_err)
+                log.info("Direct fast-path skipped (%s), using yt-dlp", direct_err)
                 cleanup_job_files(job_id)
                 await asyncio.to_thread(run_ytdlp_fast, options, url)
         else:
@@ -2674,6 +2524,10 @@ async def execute_single_job(client, job: dict):
             except Exception as ytdl_err:
                 if cancel_event.is_set():
                     raise JobCancelledError("Cancelled by user.") from ytdl_err
+
+                # YouTube should NEVER fallback to KVS/Cloudflare scrapers
+                if is_youtube_url(url):
+                    raise
 
                 log.info("Primary yt-dlp download failed (%s), trying smart fallback", ytdl_err)
                 cleanup_job_files(job_id)
@@ -2728,10 +2582,7 @@ async def execute_single_job(client, job: dict):
             raise RuntimeError("Download finished but no valid output file was produced.")
 
         wanted_ext = ".mp3" if mode == "audio" else ".mp4"
-        preferred = [
-            path for path in candidates
-            if path.suffix.lower() == wanted_ext
-        ]
+        preferred = [path for path in candidates if path.suffix.lower() == wanted_ext]
         path = max(preferred or candidates, key=lambda p: p.stat().st_size)
 
         video_meta = {"duration": int(info.get("duration") or 0), "width": 0, "height": 0}
@@ -2759,11 +2610,9 @@ async def execute_single_job(client, job: dict):
             raise JobCancelledError("Cancelled by user.")
 
         size = path.stat().st_size
-
         if size > MAX_FILE_SIZE_MB * 1024 * 1024:
             raise RuntimeError(
-                f"File size {human_size(size)} exceeds the configured "
-                f"{MAX_FILE_SIZE_MB} MB limit."
+                f"File size {human_size(size)} exceeds the configured {MAX_FILE_SIZE_MB} MB limit."
             )
 
         res_badge = f" · {video_meta['height']}p" if video_meta.get("height") else f" · {quality_label}"
@@ -2864,7 +2713,7 @@ async def execute_single_job(client, job: dict):
         next_note = f"\n⏭ Starting next queued video ({rem} remaining)…" if rem > 0 else ""
         await edit_progress(
             status_message,
-            "🛑 <b>Download Cancelled!</b>\nProcess killed & VPS storage cleared." + next_note,
+            "🛑 <b>Download Cancelled!</b>\nProcess killed & storage cleared." + next_note,
             True,
             reply_markup=None,
         )
@@ -2874,7 +2723,7 @@ async def execute_single_job(client, job: dict):
             cleanup_job_files(job_id)
             await edit_progress(
                 status_message,
-                "🛑 <b>Download Cancelled!</b>\nProcess killed & VPS storage cleared.",
+                "🛑 <b>Download Cancelled!</b>\nProcess killed & storage cleared.",
                 True,
                 reply_markup=None,
             )
@@ -2892,7 +2741,7 @@ async def execute_single_job(client, job: dict):
             cleanup_job_files(job_id)
             await edit_progress(
                 status_message,
-                "🛑 <b>Download Cancelled!</b>\nProcess killed & VPS storage cleared.",
+                "🛑 <b>Download Cancelled!</b>\nProcess killed & storage cleared.",
                 True,
                 reply_markup=None,
             )
@@ -2923,7 +2772,6 @@ async def callback_handler(client, query):
 
     parts = data.split(":", 3)
 
-    # 1. Handle Cancel Button (supports cancelling active job OR removing queued job)
     if parts[0] == "cancel":
         try:
             owner = int(parts[1])
@@ -2943,12 +2791,7 @@ async def callback_handler(client, query):
         result = cancel_specific_job(uid, target_job_id)
         if result == "queued":
             await query.answer("🗑 Removed from queue!", show_alert=False)
-            await edit_progress(
-                query.message,
-                "🗑 <b>Removed from queue.</b>",
-                True,
-                reply_markup=None,
-            )
+            await edit_progress(query.message, "🗑 <b>Removed from queue.</b>", True, reply_markup=None)
             await refresh_user_queue_positions(uid)
         elif result == "running":
             await query.answer("🛑 Force-killing download & starting next in queue…", show_alert=False)
@@ -2957,7 +2800,7 @@ async def callback_handler(client, query):
             next_note = f"\n⏭ Starting next queued video ({rem} remaining)…" if rem > 0 else ""
             await edit_progress(
                 query.message,
-                "🛑 <b>Download Cancelled!</b>\nProcess killed & VPS storage cleared." + next_note,
+                "🛑 <b>Download Cancelled!</b>\nProcess killed & storage cleared." + next_note,
                 True,
                 reply_markup=None,
             )
@@ -2965,7 +2808,6 @@ async def callback_handler(client, query):
             await query.answer("No active download found.", show_alert=False)
         return
 
-    # 2. Validate ownership & per-link session for mode / back / quality selection
     if parts[0] in ("mode", "back", "q"):
         owner_index = 2 if parts[0] == "mode" else 1
         link_index = 3 if parts[0] == "mode" else 2
@@ -3010,21 +2852,23 @@ async def callback_handler(client, query):
 
             if mode == "audio":
                 markup = InlineKeyboardMarkup([
-                    [InlineKeyboardButton(
-                        "⬇️ Download MP3",
-                        callback_data=f"q:{uid}:{link_id}:best",
-                    )],
-                    [InlineKeyboardButton(
-                        "⬅️ Format",
-                        callback_data=f"back:{uid}:{link_id}",
-                    )],
+                    [InlineKeyboardButton("⬇️ Download MP3", callback_data=f"q:{uid}:{link_id}:best")],
+                    [InlineKeyboardButton("⬅️ Format", callback_data=f"back:{uid}:{link_id}")],
                 ])
                 await edit_menu("🎵 <b>MP3 audio selected</b>", markup)
             else:
-                await edit_menu(
-                    "🎬 <b>Choose video quality</b>",
-                    quality_keyboard(uid, link_id, session.get("qualities", [])),
-                )
+                quals = session.get("qualities", [])
+                if quals:
+                    await edit_menu(
+                        "🎬 <b>Choose video quality</b>",
+                        quality_keyboard(uid, link_id, quals),
+                    )
+                else:
+                    markup = InlineKeyboardMarkup([
+                        [InlineKeyboardButton("⭐ Download Best MP4", callback_data=f"q:{uid}:{link_id}:best")],
+                        [InlineKeyboardButton("⬅️ Format", callback_data=f"back:{uid}:{link_id}")],
+                    ])
+                    await edit_menu("🎬 <b>Best available format ready</b>", markup)
             return
 
         if parts[0] == "back":
@@ -3052,7 +2896,6 @@ async def callback_handler(client, query):
             else:
                 quality_label = qualities_map.get(selection, "MP4")
 
-            # Check user's 10-item queue limit
             with active_lock:
                 q = user_queues.setdefault(uid, deque())
                 is_busy = (uid in active_jobs) or (len(q) > 0)
@@ -3080,7 +2923,7 @@ async def callback_handler(client, query):
                 )
             else:
                 init_text = (
-                    f"🚀 <b>Starting turbo download ({html.escape(quality_label)})…</b>\n"
+                    f"🚀 <b>Starting download ({html.escape(quality_label)})…</b>\n"
                     f"🎞 {html.escape(title_str[:120])}"
                 )
 
@@ -3090,7 +2933,6 @@ async def callback_handler(client, query):
                 reply_markup=cancel_keyboard(uid, job_id, is_queued=is_busy),
             )
 
-            # Snapshot the exact link info & selected quality into an independent job object
             job_obj = {
                 "job_id": job_id,
                 "uid": uid,
