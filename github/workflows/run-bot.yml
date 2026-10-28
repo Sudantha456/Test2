@@ -1,0 +1,41 @@
+name: Run ReClip Bot
+
+on:
+  workflow_dispatch: # Actions tab එකෙන් ඕනෑම වෙලාවක manual Run කිරීමට
+  schedule:
+    # පැය 5කට වරක් ස්වයංක්‍රීයව අලුත් Runner එකක් ආරම්භ කිරීමට (පැය 6 Timeout වැළැක්වීමට)
+    - cron: '0 */5 * * *'
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350 # උපරිම පැය 5යි විනාඩි 50ක්
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+
+      - name: Install System Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg aria2
+
+      - name: Install Python Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run Telegram Bot
+        env:
+          API_ID: ${{ secrets.API_ID }}
+          API_HASH: ${{ secrets.API_HASH }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          YTDLP_PROXY: "" # GitHub Runners සඳහා Proxy අවශ්‍ය නොවේ (Direct Gigabit Speed)
+        run: |
+          python3 bot.py
