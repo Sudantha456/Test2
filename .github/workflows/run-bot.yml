@@ -9,52 +9,77 @@ jobs:
   run-bot:
     runs-on: ubuntu-latest
     timeout-minutes: 350
+
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
+
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
           cache: 'pip'
-      - name: Set up Deno
+
+      - name: Set up Deno (yt-dlp JavaScript runtime)
         uses: denoland/setup-deno@v1
         with:
           deno-version: v1.x
-      - name: Install System Dependencies
+
+      - name: Install System Dependencies (FFmpeg, aria2, curl)
         run: |
           sudo apt-get update
           sudo apt-get install -y ffmpeg aria2 curl gpg dbus-x11
+
       - name: Install and Launch Cloudflare WARP SOCKS5 Proxy
         shell: bash
         run: |
           set -e
-          curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | sudo gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
-          echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/cloudflare-warp.list
+          curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg \
+            | sudo gpg --yes --dearmor \
+                --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
+
+          echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com $(lsb_release -cs) main" \
+            | sudo tee /etc/apt/sources.list.d/cloudflare-warp.list
+
           sudo apt-get update
           sudo apt-get install -y cloudflare-warp
+
           sudo warp-svc >/tmp/warp-svc.log 2>&1 &
           sleep 4
+
           warp-cli --accept-tos registration new || warp-cli registration new || true
           warp-cli --accept-tos mode proxy || warp-cli mode proxy || true
           warp-cli --accept-tos proxy port 40000 || warp-cli proxy port 40000 || true
           warp-cli --accept-tos connect || warp-cli connect || true
+
           sleep 5
+          echo "=== WARP STATUS ==="
           warp-cli status || true
-          curl --connect-timeout 10 --max-time 20 -fsS --socks5-hostname 127.0.0.1:40000 https://cloudflare.com/cdn-cgi/trace || echo "WARNING: WARP proxy test failed"
+          echo "=== WARP PROXY TEST ==="
+          curl --connect-timeout 10 --max-time 20 -fsS \
+            --socks5-hostname 127.0.0.1:40000 \
+            "https://cloudflare.com/cdn-cgi/trace" \
+            || echo "WARNING: WARP proxy test failed; bot will use its configured fallback behavior."
+
       - name: Install Python Dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -U pyrogram tgcrypto curl_cffi cloudscraper
+          pip install -U pyrogram tgcrypto curl_cffi cloudscraper playwright
           pip install -U --pre "yt-dlp[default,curl-cffi]"
+          python -m playwright install --with-deps chromium
+
       - name: Run Telegram Bot
         env:
           API_ID: ${{ secrets.API_ID }}
           API_HASH: ${{ secrets.API_HASH }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           YTDLP_PROXY: socks5://127.0.0.1:40000
+
+          # Repository Variables; defaults are used if a variable is not set.
           BOT_MAX_CONCURRENT: ${{ vars.BOT_MAX_CONCURRENT || '4' }}
           DIRECT_RANGE_CONNECTIONS: ${{ vars.DIRECT_RANGE_CONNECTIONS || '8' }}
           YTDLP_FRAGMENT_CONCURRENCY: ${{ vars.YTDLP_FRAGMENT_CONCURRENCY || '6' }}
           ARIA2_CONNECTIONS: ${{ vars.ARIA2_CONNECTIONS || '6' }}
-        run: python3 -u bot.py
+          PLAYWRIGHT_BROWSER_TIMEOUT_MS: ${{ vars.PLAYWRIGHT_BROWSER_TIMEOUT_MS || '35000' }}
+        run: |
+          python3 -u bot.py
