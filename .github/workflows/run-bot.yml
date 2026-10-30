@@ -55,7 +55,7 @@ jobs:
       - name: Install Python Dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -U pyrogram tgcrypto curl_cffi cloudscraper
+          pip install -U telethon cryptg PySocks curl_cffi cloudscraper
           pip install -U --pre "yt-dlp[default,curl-cffi]"
 
       - name: Run Telegram Bot
@@ -67,8 +67,8 @@ jobs:
           BOT_MAX_CONCURRENT: ${{ vars.BOT_MAX_CONCURRENT || '4' }}
           DIRECT_RANGE_CONNECTIONS: ${{ vars.DIRECT_RANGE_CONNECTIONS || '8' }}
           YTDLP_FRAGMENT_CONCURRENCY: ${{ vars.YTDLP_FRAGMENT_CONCURRENCY || '6' }}
-          TG_UPLOAD_TRANSMISSIONS: ${{ vars.TG_UPLOAD_TRANSMISSIONS || '4' }}
+          TG_UPLOAD_TRANSMISSIONS: ${{ vars.TG_UPLOAD_TRANSMISSIONS || '12' }}
           TG_USE_WARP_PROXY: ${{ vars.TG_USE_WARP_PROXY || '0' }}
-          ARIA2_CONNECTIONS: ${{ vars.ARIA2_CONNECTIONS || '6' }}
+          ARIA2_CONNECTIONS: ${{ vars.ARIA2_CONNECTIONS || '8' }}
         run: |
           python3 -u bot.py
